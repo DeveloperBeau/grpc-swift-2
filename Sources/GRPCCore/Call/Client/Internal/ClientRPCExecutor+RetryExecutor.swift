@@ -198,6 +198,25 @@ extension ClientRPCExecutor.RetryExecutor {
             return attemptResult
           }
         } catch {
+          let isRetryableStatusCode: Bool
+          if let rpcError = error as? RPCError {
+            isRetryableStatusCode = self.policy.retryableStatusCodes.contains(Status.Code(rpcError.code))
+          } else {
+            isRetryableStatusCode = false
+          }
+
+          if isRetryableStatusCode, attempt < self.policy.maxAttempts,
+            !(self.transport.retryThrottle?.recordFailure() ?? false)
+          {
+            try? await Task.sleep(
+              until: .now.advanced(by: delayIterator.next()!),
+              tolerance: .zero,
+              clock: .continuous
+            )
+            continue
+          }
+
+          group.cancelAll()
           return .failure(error)
         }
       }

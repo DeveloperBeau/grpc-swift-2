@@ -290,6 +290,53 @@ extension ClientRPCExecutorTests {
       XCTAssertEqual(harness.serverStreamsAccepted, 1)
     }
   }
+
+  func testRetryUnableToOpenStreamDoesNotHangUntilTheDeadline() async throws {
+    let harness = ClientRPCExecutorTestHarness(
+      transport: .throwsOnStreamCreation(code: .aborted),
+      server: .failTest
+    )
+
+    let start = ContinuousClock.now
+    await XCTAssertThrowsRPCErrorAsync {
+      try await harness.unary(
+        request: ClientRequest(message: [1, 2, 3], metadata: ["foo": "bar"]),
+        options: .retry(codes: [.unavailable], timeout: .seconds(30))
+      ) { _ in }
+    } errorHandler: { error in
+      XCTAssertEqual(error.code, .aborted)
+    }
+    let duration = ContinuousClock.now - start
+
+    // Before this fix, a stream-open failure never cancelled the deadline
+    // task, so this waited out the full 30 second deadline. Generous
+    // headroom for slow CI, matching this file's existing
+    // testRetriesWithServerPushback.
+    XCTAssertLessThanOrEqual(duration, .seconds(5))
+    XCTAssertEqual(harness.clientStreamsOpened, 0)
+    XCTAssertEqual(harness.clientStreamOpenFailures, 1)
+  }
+
+  func testRetryUnableToOpenStreamRetriesUpToTheLimit() async throws {
+    let harness = ClientRPCExecutorTestHarness(
+      transport: .throwsOnStreamCreation(code: .unavailable),
+      server: .failTest
+    )
+
+    await XCTAssertThrowsRPCErrorAsync {
+      try await harness.unary(
+        request: ClientRequest(message: [1, 2, 3], metadata: ["foo": "bar"]),
+        options: .retry(maximumAttempts: 3, codes: [.unavailable])
+      ) { _ in }
+    } errorHandler: { error in
+      XCTAssertEqual(error.code, .unavailable)
+    }
+
+    // Every attempt failed before its stream opened; all 3 configured
+    // attempts must have been tried, not just the first.
+    XCTAssertEqual(harness.clientStreamsOpened, 0)
+    XCTAssertEqual(harness.clientStreamOpenFailures, 3)
+  }
 }
 
 @available(gRPCSwift 2.0, *)
