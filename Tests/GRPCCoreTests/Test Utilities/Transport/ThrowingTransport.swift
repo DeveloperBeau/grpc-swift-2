@@ -50,6 +50,40 @@ struct ThrowOnStreamCreationTransport: ClientTransport {
   }
 }
 
+/// A plain error, not an `RPCError`, thrown by `NotAnRPCErrorOnStreamCreationTransport`
+/// to prove that a stream-open failure which isn't an `RPCError` is never treated as
+/// retryable.
+struct NotAnRPCError: Error {}
+
+@available(gRPCSwift 2.0, *)
+struct NotAnRPCErrorOnStreamCreationTransport: ClientTransport {
+  typealias Bytes = [UInt8]
+
+  let retryThrottle: RetryThrottle? = RetryThrottle(maxTokens: 10, tokenRatio: 0.1)
+
+  func connect() async throws {
+    // no-op
+  }
+
+  func beginGracefulShutdown() {
+    // no-op
+  }
+
+  func config(
+    forMethod descriptor: MethodDescriptor
+  ) -> MethodConfig? {
+    return nil
+  }
+
+  func withStream<T>(
+    descriptor: MethodDescriptor,
+    options: CallOptions,
+    _ closure: (RPCStream<Inbound, Outbound>, ClientContext) async throws -> T
+  ) async throws -> T {
+    throw NotAnRPCError()
+  }
+}
+
 @available(gRPCSwift 2.0, *)
 struct ThrowOnRunServerTransport: ServerTransport {
   typealias Bytes = [UInt8]
