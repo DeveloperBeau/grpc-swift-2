@@ -115,8 +115,8 @@ func runScenario(code: RPCError.Code, maxAttempts: Int) async -> ScenarioResult 
             ) { _ in }
         }
     } catch {
-        // Expected: every scenario here ends in failure, since the transport never opens a
-        // stream. The interesting facts are how long it took and how many attempts ran.
+        // Every scenario fails, because the transport never opens a stream. What the
+        // scenario measures is how long the failure took and how many attempts ran.
     }
     let elapsed = start.duration(to: clock.now)
     let components = elapsed.components
@@ -147,34 +147,20 @@ print("""
 gRPC retry vs. deadline repro
 ==============================
 
-Setup: a client transport whose withStream throws before any stream opens, standing
-in for a connection that cannot be established. Every call below runs with a retry
-policy (max 3 attempts, retryable on .unavailable, short backoff) and a 10 second
-timeout.
-
-What this solves: an app making a retried RPC while its connection is down or not
-yet ready hits exactly this kind of pre-stream failure. A correct client already
-knows the call failed the moment the transport says so, so waiting out the deadline
-afterward is pure delay - something that should fail or retry right away instead
-hangs for the full timeout. Separately, a transient .unavailable failure is exactly
-what the retry policy exists for; if the executor never applies that policy to a
-pre-stream failure, a call that would have succeeded on a second attempt fails
-outright after just one. A fixed executor fails immediately when the error is not
-retryable, and actually retries when it is.
+The transport's withStream throws before any stream opens, the way a connection
+that cannot be established does. Every call uses a retry policy of 3 attempts,
+retrying on .unavailable with a short backoff, and a 10 second timeout.
 
 """)
 
 print("Scenario 1: non-retryable failure (.failedPrecondition)")
-print("A correct client sees that this status is not in the retry policy's list, gives")
-print("up after the single attempt, and returns right away - it has no reason to wait")
-print("out a 10 second deadline it never needed.")
+print("The policy does not retry this code, so the client should return the failure")
+print("after one attempt, with no wait.")
 let scenario1 = await runScenario(code: .failedPrecondition, maxAttempts: 3)
 printVerdicts(result: scenario1, expectedAttempts: 1, maxAttempts: 3)
 
 print("Scenario 2: retryable failure (.unavailable)")
-print("The retry policy allows up to 3 attempts for .unavailable, so a correct client")
-print("retries twice more after the first pre-stream failure. Each attempt fails fast")
-print("(no stream ever opens), so the whole call should finish well before the 10")
-print("second deadline.")
+print("The policy retries this code, so the client should make all 3 attempts. Each one")
+print("fails at once, so the call should end well inside the 10 second timeout.")
 let scenario2 = await runScenario(code: .unavailable, maxAttempts: 3)
 printVerdicts(result: scenario2, expectedAttempts: 3, maxAttempts: 3)

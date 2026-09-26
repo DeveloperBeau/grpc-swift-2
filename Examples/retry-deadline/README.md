@@ -1,20 +1,23 @@
 # grpc-swift-2 retry vs. deadline repro
 
-Two tiny standalone Swift programs that show a bug in `RetryExecutor.execute` (in
-`GRPCCore`, `Sources/GRPCCore/Call/Client/Internal/ClientRPCExecutor+RetryExecutor.swift`)
-and confirm a fix for it.
+Two small Swift programs. One shows a bug in `RetryExecutor.execute` (`GRPCCore`,
+`Sources/GRPCCore/Call/Client/Internal/ClientRPCExecutor+RetryExecutor.swift`); the
+other runs the same code against the fix.
 
 ## What this solves
 
-An app making a retried RPC while its connection is down or not yet ready will run
-into exactly the kind of failure these programs simulate: the stream never opens.
-A correct client already knows the call failed the moment the transport says so, so
-waiting out the deadline afterward is pure delay - something that should fail or
-retry right away instead hangs for the full timeout. Separately, a transient
-`.unavailable` failure is exactly what a retry policy exists for. If the executor
-never applies that policy to a pre-stream failure, a call that would have succeeded
-on a second attempt fails outright after just one. The fix makes such calls fail
-immediately when the error is not retryable, and actually retry when it is.
+A retried RPC made while the connection is down, or not ready yet, fails before its
+stream opens. That is the failure these programs simulate. The client knows the
+call has failed as soon as the transport throws, yet it waits for the full timeout
+before reporting it.
+
+The second problem is quieter. A transient `.unavailable` is the case a retry
+policy is for, but the executor never applies the policy to a failure before the
+stream opens. A call that would have succeeded on its second attempt fails after
+its first.
+
+With the fix, such a call fails at once when the error is not retryable, and
+retries when it is.
 
 ## The bug
 
@@ -30,21 +33,19 @@ When `ClientTransport.withStream` throws before a stream opens, the attempt loop
 Two things are missing:
 
 1. **No `group.cancelAll()`.** `execute` runs a `withTaskGroup` that also holds a
-   child task sleeping until the overall deadline. Returning from the closure
-   without cancelling that task doesn't cancel it: `withTaskGroup` still waits for
-   every child task to finish before it returns. So even though the attempt failed
-   immediately, the whole call sits there until the deadline task's sleep finishes,
-   which takes as long as the configured timeout.
+   child task sleeping until the overall deadline. Returning from the closure does
+   not end that task, and `withTaskGroup` waits for every child task before it
+   returns. The attempt failed at once, but the call waits out the deadline task's
+   sleep, which is the full configured timeout.
 2. **No check against the retry policy.** The catch block returns the failure
-   straight away, without ever looking at `self.policy.retryableStatusCodes` or
-   `attempt < self.policy.maxAttempts`. So a pre-stream failure gets exactly one
-   attempt, no matter how the retry policy is configured, and no matter whether the
-   status code (for example `.unavailable`) is one the policy says to retry.
+   without looking at `self.policy.retryableStatusCodes` or
+   `attempt < self.policy.maxAttempts`. A pre-stream failure gets one attempt
+   whatever the policy says, even for a code such as `.unavailable` that the
+   policy lists as retryable.
 
-The fix in this repository adds the missing retry check, then calls
-`group.cancelAll()` before returning the failure: if the error is retryable and
-there are attempts left, it backs off and retries instead of returning, and it
-cancels the deadline task on every path that actually gives up.
+The fix adds the missing retry check. When the error is retryable and attempts
+remain, the loop backs off and tries again. When it gives up, it calls
+`group.cancelAll()` first, so the deadline task ends with it.
 
 The patch is 19 lines in the `catch` block:
 
@@ -75,15 +76,18 @@ The patch is 19 lines in the `catch` block:
 
 ## Can existing configuration avoid the problem?
 
-Before patching a dependency, it is worth asking whether an existing setting
-already avoids the problem. The sections below cover each option and what it costs.
-Everything was checked against 2.4.3, which is the latest release as of September
-2026. The last upstream change to `ClientRPCExecutor+RetryExecutor.swift` is #46
-("Return deadlineExceeded when client timeout fires"), and no open issue covers this.
+Each option below uses what grpc-swift-2 already offers, with what it costs.
+All of them were checked against 2.4.3 on 26 September 2026.
 
 ### "Upgrade grpc-swift-2."
 
-There is nothing to upgrade to. 2.4.3 is the newest release and still has this code.
+There is nothing to upgrade to. 2.4.3 is the newest release, and upstream `main`
+still points at the 2.4.3 commit, so no unreleased change is waiting either. The
+last change to `ClientRPCExecutor+RetryExecutor.swift` was #46 ("Return
+deadlineExceeded when client timeout fires"), which shipped before 2.4.3. No
+issue reports this bug. The one open pull request that touches the file, #51
+(a draft adding client diagnostics), edits the same `catch` block to record the
+error and leaves `return .failure(error)` as it is.
 
 ### "Turn retries off for that method."
 
@@ -95,19 +99,17 @@ correctly today.
 
 ### "Use a hedging policy instead of a retry policy."
 
-The hedging executor does handle it correctly: its `.noStreamAvailable` case calls
-`group.cancelAll()` and returns (`ClientRPCExecutor+HedgingExecutor.swift`). That is
-good evidence the retry executor's catch block is an oversight rather than a design
-choice. But hedging is not a substitute for retries. It sends parallel attempts, is
-only safe for idempotent methods, and on a pre-stream failure it gives up rather
-than trying again.
+The hedging executor gets this case right. Its `.noStreamAvailable` case calls
+`group.cancelAll()` and returns (`ClientRPCExecutor+HedgingExecutor.swift`), which
+suggests the retry executor's missing call is an oversight. Hedging has different
+semantics, though. It sends attempts in parallel, is only safe for idempotent
+methods, and gives up on a pre-stream failure without trying again.
 
 ### "Set a shorter timeout."
 
-In the buggy version the hang lasts exactly as long as the timeout. A shorter
-timeout shortens the hang, but it also cuts off calls that are legitimately slow,
-and the call still makes only one attempt. The timeout ends up tuned around a bug
-instead of around the method.
+The hang lasts as long as the timeout, so a shorter timeout shortens it. It also
+cuts off calls that are slow for good reasons, and the call still makes one
+attempt.
 
 ### "Don't set a timeout at all."
 
@@ -117,11 +119,10 @@ unbounded, which is worse than the bug.
 
 ### "Set `waitForReady: true`."
 
-That changes what happens when the connection is not ready yet: the call queues
-instead of failing. It does not help a channel that is shutting down or a transport
-that is closed. Those still throw before the stream opens, and hit the same catch
-block. It also waits when you may want the call to fail fast. It is a legitimate
-per-method choice, but not a fix for the executor.
+With `waitForReady`, a call made before the connection is ready queues until it is.
+A channel that is shutting down, or a transport that is closed, still throws before
+the stream opens and lands in the same catch block. Queueing also costs the fast
+failure some callers want. It suits some methods, and leaves the executor as it is.
 
 ### "The transport already retries stream creation."
 
@@ -141,12 +142,11 @@ interceptor, so no interceptor can observe it.
 
 ### "Just add `group.cancelAll()`. The retry part is a separate change."
 
-That is true: the two halves are independent, and the one-line `cancelAll()` on its
-own closes the hang. On its own, though, it turns a slow failure into a fast one and
-still ignores the retry policy. With `.unavailable` in `retryableStatusCodes` and
-`maxAttempts: 3`, the call still makes one attempt. `.unavailable` is exactly what
-the NIO transport throws before a stream opens. The two halves are kept apart in
-the patch, so upstream can take either one.
+The two halves are independent, and `cancelAll()` alone closes the hang. What it
+leaves is a fast failure that still ignores the policy: with `.unavailable` in
+`retryableStatusCodes` and `maxAttempts: 3`, the call makes one attempt. The NIO
+transport throws `.unavailable` in several of its pre-stream cases. The patch keeps
+the two halves separate, so upstream can take either one.
 
 ### "Why not reuse `executeAttempt`'s retry check?"
 
@@ -165,8 +165,8 @@ response to carry it.
 ### "A non-`RPCError` should be retried too."
 
 The retry policy is expressed in status codes, and an error that is not an
-`RPCError` has none. The patch treats it as not retryable, which is what the
-policy can actually express. `ClientRPCExecutorTests+Retries.swift` pins this with
+`RPCError` has none, so the policy has no way to name it. The patch treats it as
+not retryable. `ClientRPCExecutorTests+Retries.swift` pins this with
 `testRetryUnableToOpenStreamWithANonRPCErrorReturnsAfterOneAttempt`.
 
 ### Known limitation
@@ -174,35 +174,33 @@ policy can actually express. `ClientRPCExecutorTests+Retries.swift` pins this wi
 Between pre-stream attempts, the patch does not check the deadline, and neither does
 the existing post-stream retry path while it sleeps a backoff. If the deadline passes
 during a run of pre-stream failures, the call still makes its remaining attempts.
-It then reports the last error rather than `.deadlineExceeded`. The overrun is
+It then reports the last error, not `.deadlineExceeded`. The overrun is
 bounded by `maxAttempts` and the policy's `maxBackoff`. Checking the deadline before
 `continue` would close it, and upstream may prefer that.
 
 ## Layout
 
-- `bug/` - depends on upstream `grpc/grpc-swift-2` pinned to revision
-  `ac33066eb6edb1a21a6ca172ea8184a9b06f3cc7` (2.4.3, unpatched).
-- `fix/` - depends on this repository's own checkout (`path: "../../.."`), so it
-  runs whatever revision is checked out here.
+- `bug/` resolves upstream `grpc/grpc-swift-2` at revision
+  `ac33066eb6edb1a21a6ca172ea8184a9b06f3cc7`, which is 2.4.3 without the fix.
+- `fix/` resolves this repository's own checkout (`path: "../../.."`), so it runs
+  whatever revision is checked out here.
 
-Both programs are otherwise the same SwiftPM executable: a `Package.swift` and one
-`Sources/<target>/main.swift`. The `main.swift` files are byte-for-byte identical
-(a diff between them is empty); only the dependency each `Package.swift` resolves
-to differs. They are separate packages with separate `.build` directories, so
-resolving one never disturbs the other.
+Each is a SwiftPM executable with one `Package.swift` and one `main.swift`. The two
+`main.swift` files are byte-for-byte identical; only the dependency differs. Each
+package has its own `.build` directory, so resolving one never disturbs the other.
 
 `main.swift` defines a `ClientTransport` whose `withStream` always throws an
-`RPCError` before a stream opens, counts attempts, and runs a `GRPCClient` against
-it with a retry policy (max 3 attempts, retryable on `.unavailable`, a short
-backoff) and a 10 second timeout, for two scenarios:
+`RPCError` before a stream opens, and counts attempts. It runs a `GRPCClient` over
+that transport with a retry policy (3 attempts, retrying `.unavailable`, short
+backoff) and a 10 second timeout, in two scenarios:
 
-1. A non-retryable failure (`.failedPrecondition`): a correct client gives up after
-   one attempt and returns right away.
-2. A retryable failure (`.unavailable`): a correct client retries up to 3 times,
-   with every attempt failing fast, so it finishes in well under 10 seconds.
+1. `.failedPrecondition`, which the policy does not retry. The client should
+   return after one attempt, with no wait.
+2. `.unavailable`, which the policy retries. The client should make 3 attempts,
+   each failing at once, and finish well inside the timeout.
 
-Each program prints elapsed time and attempt count for both scenarios, with a
-`BUG:` or `OK:` verdict line for each fact.
+For each scenario the program prints the elapsed time and the attempt count, each
+followed by a `BUG:` or `OK:` line.
 
 ## Running it
 
@@ -222,39 +220,26 @@ cd fix && swift run
 gRPC retry vs. deadline repro
 ==============================
 
-Setup: a client transport whose withStream throws before any stream opens, standing
-in for a connection that cannot be established. Every call below runs with a retry
-policy (max 3 attempts, retryable on .unavailable, short backoff) and a 10 second
-timeout.
-
-What this solves: an app making a retried RPC while its connection is down or not
-yet ready hits exactly this kind of pre-stream failure. A correct client already
-knows the call failed the moment the transport says so, so waiting out the deadline
-afterward is pure delay - something that should fail or retry right away instead
-hangs for the full timeout. Separately, a transient .unavailable failure is exactly
-what the retry policy exists for; if the executor never applies that policy to a
-pre-stream failure, a call that would have succeeded on a second attempt fails
-outright after just one. A fixed executor fails immediately when the error is not
-retryable, and actually retries when it is.
+The transport's withStream throws before any stream opens, the way a connection
+that cannot be established does. Every call uses a retry policy of 3 attempts,
+retrying on .unavailable with a short backoff, and a 10 second timeout.
 
 Scenario 1: non-retryable failure (.failedPrecondition)
-A correct client sees that this status is not in the retry policy's list, gives
-up after the single attempt, and returns right away - it has no reason to wait
-out a 10 second deadline it never needed.
-  elapsed: 10.006s
+The policy does not retry this code, so the client should return the failure
+after one attempt, with no wait.
+  elapsed: 10.005s
   attempts: 1
   BUG: failed after 10.0s (expected ~0s)
   OK: 1 attempt(s) (matches policy)
 
 Scenario 2: retryable failure (.unavailable)
-The retry policy allows up to 3 attempts for .unavailable, so a correct client
-retries twice more after the first pre-stream failure. Each attempt fails fast
-(no stream ever opens), so the whole call should finish well before the 10
-second deadline.
-  elapsed: 10.001s
+The policy retries this code, so the client should make all 3 attempts. Each one
+fails at once, so the call should end well inside the 10 second timeout.
+  elapsed: 10.005s
   attempts: 1
   BUG: failed after 10.0s (expected ~0s)
   BUG: 1 attempt(s) (policy allows 3)
+
 ```
 
 `fix/` (this repository):
@@ -263,43 +248,32 @@ second deadline.
 gRPC retry vs. deadline repro
 ==============================
 
-Setup: a client transport whose withStream throws before any stream opens, standing
-in for a connection that cannot be established. Every call below runs with a retry
-policy (max 3 attempts, retryable on .unavailable, short backoff) and a 10 second
-timeout.
-
-What this solves: an app making a retried RPC while its connection is down or not
-yet ready hits exactly this kind of pre-stream failure. A correct client already
-knows the call failed the moment the transport says so, so waiting out the deadline
-afterward is pure delay - something that should fail or retry right away instead
-hangs for the full timeout. Separately, a transient .unavailable failure is exactly
-what the retry policy exists for; if the executor never applies that policy to a
-pre-stream failure, a call that would have succeeded on a second attempt fails
-outright after just one. A fixed executor fails immediately when the error is not
-retryable, and actually retries when it is.
+The transport's withStream throws before any stream opens, the way a connection
+that cannot be established does. Every call uses a retry policy of 3 attempts,
+retrying on .unavailable with a short backoff, and a 10 second timeout.
 
 Scenario 1: non-retryable failure (.failedPrecondition)
-A correct client sees that this status is not in the retry policy's list, gives
-up after the single attempt, and returns right away - it has no reason to wait
-out a 10 second deadline it never needed.
+The policy does not retry this code, so the client should return the failure
+after one attempt, with no wait.
   elapsed: 0.001s
   attempts: 1
   OK: failed after 0.001s (~0s expected)
   OK: 1 attempt(s) (matches policy)
 
 Scenario 2: retryable failure (.unavailable)
-The retry policy allows up to 3 attempts for .unavailable, so a correct client
-retries twice more after the first pre-stream failure. Each attempt fails fast
-(no stream ever opens), so the whole call should finish well before the 10
-second deadline.
-  elapsed: 0.091s
+The policy retries this code, so the client should make all 3 attempts. Each one
+fails at once, so the call should end well inside the 10 second timeout.
+  elapsed: 0.046s
   attempts: 3
-  OK: failed after 0.091s (~0s expected)
+  OK: failed after 0.046s (~0s expected)
   OK: 3 attempt(s) (matches policy)
+
 ```
 
-Scenario 1's timing is the only thing that differs between the two, since
-`.failedPrecondition` isn't retryable in either version, so both take exactly one
-attempt. Scenario 2 differs on both counts: upstream stops after one attempt and
-still takes 10 seconds to report it, while the fix retries all 3 attempts and
-finishes in well under a tenth of a second.
+In scenario 1 only the timing differs: `.failedPrecondition` is not retryable in
+either version, so both make one attempt. Upstream takes the full 10 seconds to
+report it; the fix reports it in about a millisecond.
+
+Scenario 2 differs on both counts. Upstream stops after one attempt and still waits
+10 seconds. The fix makes all 3 attempts and finishes in well under a tenth of a
+second.
