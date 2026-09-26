@@ -1,5 +1,12 @@
 # gRPC Swift
 
+> **About this copy.** This is [grpc/grpc-swift-2](https://github.com/grpc/grpc-swift-2)
+> 2.4.3 with one fix to `RetryExecutor`: a retried call whose stream fails to open
+> now applies the retry policy and cancels its deadline task, instead of making a
+> single attempt and then waiting out the whole deadline. The tag `2.4.3` here
+> points at the fixed commit. [Examples/retry-deadline](Examples/retry-deadline)
+> shows the bug against upstream and the fix against this repository.
+
 This repository contains a gRPC implementation for Swift. You can read more
 about gRPC on the [gRPC project's website][grpcio].
 
