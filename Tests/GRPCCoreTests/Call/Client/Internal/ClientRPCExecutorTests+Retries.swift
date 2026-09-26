@@ -67,6 +67,27 @@ extension ClientRPCExecutorTests {
     XCTAssertEqual(harness.serverStreamsAccepted, 3)
   }
 
+  func testRetriesDeliverSingleRequestMessageWrittenWhileAttemptIsSubscribing() async throws {
+    // The request producer writes into the retry buffer concurrently with the first attempt
+    // subscribing to it. Yield a varying number of times before writing so that the attempt
+    // sometimes starts waiting for the message just before it's written and the stream ends.
+    for iteration in 0 ..< 1_000 {
+      let harness = ClientRPCExecutorTestHarness(server: .echo)
+      let message = [UInt8(truncatingIfNeeded: iteration)]
+      try await harness.clientStreaming(
+        request: StreamingClientRequest {
+          for _ in 0 ..< iteration % 8 {
+            await Task.yield()
+          }
+          try await $0.write(message)
+        },
+        options: .retry(codes: [.unavailable])
+      ) { response in
+        XCTAssertEqual(try response.message, message, "iteration \(iteration)")
+      }
+    }
+  }
+
   func testRetriesRespectRetryableCodes() async throws {
     let harness = self.makeHarnessForRetries(rejectUntilAttempt: 3, withCode: .unavailable)
     try await harness.bidirectional(
