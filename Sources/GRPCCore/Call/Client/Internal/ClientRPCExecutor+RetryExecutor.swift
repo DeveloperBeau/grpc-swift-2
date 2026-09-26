@@ -200,7 +200,9 @@ extension ClientRPCExecutor.RetryExecutor {
         } catch {
           let isRetryableStatusCode: Bool
           if let rpcError = error as? RPCError {
-            isRetryableStatusCode = self.policy.retryableStatusCodes.contains(Status.Code(rpcError.code))
+            isRetryableStatusCode = self.policy.retryableStatusCodes.contains(
+              Status.Code(rpcError.code)
+            )
           } else {
             isRetryableStatusCode = false
           }
