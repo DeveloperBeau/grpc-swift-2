@@ -233,6 +233,60 @@ final class BroadcastAsyncSequenceTests: XCTestCase {
     }
   }
 
+  func testElementWrittenAndFinishedWhileSubscriberIsSuspendingIsDelivered() async throws {
+    // 'nextElement(forSubscriber:)' acquires the lock twice when it has to suspend: once to find
+    // there's no element, and again to store the continuation. Replay the case where the
+    // producer writes an element and finishes between those two steps.
+    var state = _BroadcastSequenceStateMachine<Int>(bufferSize: 16)
+    let id = state.subscribe()
+
+    guard case .suspend = state.nextElement(forSubscriber: id) else {
+      return XCTFail("Subscriber should suspend when no elements have been written")
+    }
+
+    _ = state.yield(42)
+    _ = state.finish(result: .success(()))
+
+    let element = try await withCheckedThrowingContinuation { continuation in
+      switch state.setContinuation(continuation, forSubscription: id) {
+      case .resume(let continuation, let result, _):
+        continuation.resume(with: result)
+      case .none:
+        XCTFail("Continuation should be resumed once the stream has finished")
+        if case .resume(let continuation, let result) = state.cancelSubscription(withID: id) {
+          continuation.resume(with: result)
+        }
+      }
+    }
+
+    XCTAssertEqual(element, 42)
+  }
+
+  func testSingleElementWrittenAndFinishedConcurrentlyWithSubscriberIsDelivered() async throws {
+    for iteration in 0 ..< 10_000 {
+      let (stream, source) = BroadcastAsyncSequence.makeStream(of: Int.self, bufferSize: 16)
+      let elements = try await withThrowingTaskGroup(of: [Int]?.self) { group in
+        group.addTask {
+          try await stream.collect()
+        }
+        group.addTask {
+          try await source.write(iteration)
+          source.finish()
+          return nil
+        }
+
+        var collected: [Int]?
+        for try await result in group {
+          if let result { collected = result }
+        }
+        return collected
+      }
+
+      XCTAssertEqual(elements, [iteration], "iteration \(iteration)")
+      if elements != [iteration] { return }
+    }
+  }
+
   func testCancelProducer() async throws {
     let (_, source) = BroadcastAsyncSequence.makeStream(of: Int.self, bufferSize: 16)
     for i in 0 ..< 15 {

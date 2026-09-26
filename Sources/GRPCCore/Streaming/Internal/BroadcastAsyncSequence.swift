@@ -919,6 +919,22 @@ struct _BroadcastSequenceStateMachine<Element: Sendable>: Sendable {
       }
 
       @inlinable
+      mutating func setContinuation(
+        _ continuation: ConsumerContinuation,
+        forSubscription id: _BroadcastSequenceStateMachine<Element>.Subscriptions.ID
+      ) -> OnSetContinuation {
+        // 'next(id)' must be checked first: elements might've been provided and the sequence
+        // finished between the lock being dropped and a continuation being created and the lock
+        // being acquired again. The sequence has finished so 'next(id)' never suspends.
+        switch self.next(id) {
+        case .return(let resultAndProducers):
+          return .resume(continuation, resultAndProducers.nextResult, resultAndProducers.producers)
+        case .suspend:
+          fatalError("Internal inconsistency")
+        }
+      }
+
+      @inlinable
       mutating func subscribe() -> _BroadcastSequenceStateMachine<Element>.Subscriptions.ID {
         self.subscriptions.subscribe()
       }
@@ -1196,8 +1212,10 @@ struct _BroadcastSequenceStateMachine<Element: Sendable>: Sendable {
       onSetContinuation = state.setContinuation(continuation, forSubscription: id)
       self._state = .streaming(state)
 
-    case .finished(let state):
-      onSetContinuation = .resume(continuation, state.result.map { _ in nil }, nil)
+    case .finished(var state):
+      self._state = ._modifying
+      onSetContinuation = state.setContinuation(continuation, forSubscription: id)
+      self._state = .finished(state)
 
     case ._modifying:
       // All values must have been produced, nothing to wait for.
