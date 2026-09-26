@@ -337,6 +337,30 @@ extension ClientRPCExecutorTests {
     XCTAssertEqual(harness.clientStreamsOpened, 0)
     XCTAssertEqual(harness.clientStreamOpenFailures, 3)
   }
+
+  func testRetryUnableToOpenStreamWithANonRPCErrorReturnsAfterOneAttempt() async throws {
+    let harness = ClientRPCExecutorTestHarness(
+      transport: .throwsNotAnRPCErrorOnStreamCreation,
+      server: .failTest
+    )
+
+    do {
+      try await harness.unary(
+        request: ClientRequest(message: [1, 2, 3], metadata: ["foo": "bar"]),
+        options: .retry(maximumAttempts: 3, codes: [.unavailable])
+      ) { _ in }
+      XCTFail("Expected the call to throw")
+    } catch is NotAnRPCError {
+      // Expected: a plain error, not an RPCError, is surfaced unchanged.
+    } catch {
+      XCTFail("Error had unexpected type '\(type(of: error))'")
+    }
+
+    // A pre-stream failure that isn't an RPCError is never treated as
+    // retryable, no matter how many attempts the policy would allow.
+    XCTAssertEqual(harness.clientStreamsOpened, 0)
+    XCTAssertEqual(harness.clientStreamOpenFailures, 1)
+  }
 }
 
 @available(gRPCSwift 2.0, *)

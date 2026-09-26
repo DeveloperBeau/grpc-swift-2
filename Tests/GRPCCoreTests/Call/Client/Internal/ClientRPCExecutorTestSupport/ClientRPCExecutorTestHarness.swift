@@ -64,12 +64,19 @@ struct ClientRPCExecutorTestHarness {
       let client = ThrowOnStreamCreationTransport(code: code)
       self.serverTransport = StreamCountingServerTransport(wrapping: server)
       self.clientTransport = StreamCountingClientTransport(wrapping: client)
+
+    case .throwsNotAnRPCErrorOnStreamCreation:
+      let server = InProcessTransport.Server(peer: "in-process:1234")  // Will never be called.
+      let client = NotAnRPCErrorOnStreamCreationTransport()
+      self.serverTransport = StreamCountingServerTransport(wrapping: server)
+      self.clientTransport = StreamCountingClientTransport(wrapping: client)
     }
   }
 
   enum Transport {
     case inProcess
     case throwsOnStreamCreation(code: RPCError.Code)
+    case throwsNotAnRPCErrorOnStreamCreation
   }
 
   func unary(
